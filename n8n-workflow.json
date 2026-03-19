@@ -1,0 +1,150 @@
+{
+  "name": "TimeCapsule - Daily Delivery + Razorpay",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 9 * * *" }]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Daily 9AM Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.id, c.title, c.message, c.media_url, c.media_type, c.recipient_name, c.recipient_email, u.name as sender_name FROM capsules c JOIN users u ON c.user_id = u.id WHERE c.deliver_at <= NOW() AND c.status = 'pending' LIMIT 100;"
+      },
+      "id": "fetch-due-capsules",
+      "name": "Fetch Due Capsules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [460, 300],
+      "credentials": { "postgres": { "id": "postgres-creds", "name": "TimeCapsule DB" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [{ "value1": "={{ $json.length }}", "operation": "larger", "value2": 0 }]
+        }
+      },
+      "id": "check-if-any",
+      "name": "Any Capsules?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": { "batchSize": 1, "options": {} },
+      "id": "split-capsules",
+      "name": "Loop Each Capsule",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.brevo.com/v3/smtp/email",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "api-key", "value": "={{ $env.BREVO_API_KEY }}" }]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "sender", "value": "={\"name\":\"TimeCapsule\",\"email\":\"noreply@yourdomain.com\"}" },
+            { "name": "to", "value": "=[{\"email\":\"{{ $json.recipient_email }}\",\"name\":\"{{ $json.recipient_name }}\"}]" },
+            { "name": "subject", "value": "=💌 A message for you from {{ $json.sender_name }}" },
+            { "name": "htmlContent", "value": "=<div style=\"font-family:Georgia,serif;max-width:600px;margin:0 auto;background:#fdf6e3;padding:40px;border-radius:8px;\"><div style=\"border-bottom:2px solid #c8a96e;padding-bottom:20px;margin-bottom:30px;\"><h1 style=\"color:#5c3d1e;font-size:28px;margin:0;\">💌 A message from the past</h1><p style=\"color:#8b6343;font-size:14px;\">Sent with TimeCapsule · Delivered on {{ $now.format('MMMM d, yyyy') }}</p></div><h2 style=\"color:#5c3d1e;\">{{ $json.title }}</h2><div style=\"background:#fff8e7;padding:24px;border-left:4px solid #c8a96e;border-radius:4px;font-size:16px;line-height:1.8;color:#3d2b1f;\">{{ $json.message }}</div>{{ $json.media_url ? '<div style=\"margin-top:24px;\"><img src=\"'+$json.media_url+'\" style=\"max-width:100%;border-radius:8px;\" /></div>' : '' }}<div style=\"margin-top:32px;padding-top:20px;border-top:1px solid #e8d5b0;color:#8b6343;font-size:12px;\">This message was scheduled in advance by {{ $json.sender_name }} using TimeCapsule.</div></div>" }
+          ]
+        }
+      },
+      "id": "send-email-brevo",
+      "name": "Send via Brevo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE capsules SET status = 'sent', sent_at = NOW(), updated_at = NOW() WHERE id = '{{ $('Loop Each Capsule').item.json.id }}';"
+      },
+      "id": "mark-as-sent",
+      "name": "Mark as Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [1340, 200],
+      "credentials": { "postgres": { "id": "postgres-creds", "name": "TimeCapsule DB" } }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "razorpay-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "razorpay-webhook",
+      "name": "Razorpay Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 600],
+      "webhookId": "razorpay-payment-captured"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{ $json.body.event }}", "operation": "equals", "value2": "payment.captured" }]
+        }
+      },
+      "id": "check-payment-event",
+      "name": "Is Payment Captured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 600]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE payments SET status = 'paid', razorpay_payment_id = '{{ $json.body.payload.payment.entity.id }}' WHERE razorpay_order_id = '{{ $json.body.payload.payment.entity.order_id }}'; UPDATE users SET plan = (SELECT plan FROM payments WHERE razorpay_order_id = '{{ $json.body.payload.payment.entity.order_id }}'), plan_expires_at = NOW() + INTERVAL '30 days', updated_at = NOW() WHERE id = (SELECT user_id FROM payments WHERE razorpay_order_id = '{{ $json.body.payload.payment.entity.order_id }}');"
+      },
+      "id": "upgrade-user-plan",
+      "name": "Upgrade User Plan",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [680, 500],
+      "credentials": { "postgres": { "id": "postgres-creds", "name": "TimeCapsule DB" } }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"status\":\"ok\"}"
+      },
+      "id": "respond-ok",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 500]
+    }
+  ],
+  "connections": {
+    "Daily 9AM Trigger": { "main": [[{ "node": "Fetch Due Capsules", "type": "main", "index": 0 }]] },
+    "Fetch Due Capsules": { "main": [[{ "node": "Any Capsules?", "type": "main", "index": 0 }]] },
+    "Any Capsules?": { "main": [[{ "node": "Loop Each Capsule", "type": "main", "index": 0 }], []] },
+    "Loop Each Capsule": { "main": [[{ "node": "Send via Brevo", "type": "main", "index": 0 }], []] },
+    "Send via Brevo": { "main": [[{ "node": "Mark as Sent", "type": "main", "index": 0 }]] },
+    "Mark as Sent": { "main": [[{ "node": "Loop Each Capsule", "type": "main", "index": 0 }]] },
+    "Razorpay Webhook": { "main": [[{ "node": "Is Payment Captured?", "type": "main", "index": 0 }]] },
+    "Is Payment Captured?": { "main": [[{ "node": "Upgrade User Plan", "type": "main", "index": 0 }], []] },
+    "Upgrade User Plan": { "main": [[{ "node": "Respond 200", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "tags": ["timecapsule"]
+}
